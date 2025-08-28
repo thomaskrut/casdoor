@@ -929,8 +929,152 @@ func (c *ApiController) Login() {
 				c.Ctx.Input.SetParam("recordUserId", user.GetId())
 				c.Ctx.Input.SetParam("recordSignup", "true")
 			} else if provider.Category == "SAML" {
-				// TODO: since we get the user info from SAML response, we can try to create the user
-				resp = &Response{Status: "error", Msg: fmt.Sprintf(c.T("general:The user: %s doesn't exist"), util.GetId(application.Organization, userInfo.Id))}
+				// Sign up via SAML - create user if they don't exist
+				if application.EnableLinkWithEmail {
+					if userInfo.Email != "" {
+						// Find existing user with Email
+						user, err = object.GetUserByField(application.Organization, "email", userInfo.Email)
+						if err != nil {
+							c.ResponseError(err.Error())
+							return
+						}
+					}
+
+					if user == nil && userInfo.Phone != "" {
+						// Find existing user with phone number
+						user, err = object.GetUserByField(application.Organization, "phone", userInfo.Phone)
+						if err != nil {
+							c.ResponseError(err.Error())
+							return
+						}
+					}
+				}
+
+				if user == nil || user.IsDeleted {
+					if !application.EnableSignUp {
+						c.ResponseError(fmt.Sprintf(c.T("auth:The account for provider: %s and username: %s (%s) does not exist and is not allowed to sign up as new account, please contact your IT support"), provider.Type, userInfo.Username, userInfo.DisplayName))
+						return
+					}
+
+					// Create new user from SAML response
+					properties := map[string]string{}
+					var count int64
+					count, err = object.GetUserCount(application.Organization, "", "", "")
+					if err != nil {
+						c.ResponseError(err.Error())
+						return
+					}
+
+					properties["no"] = strconv.Itoa(int(count + 2))
+					var initScore int
+					initScore, err = organization.GetInitScore()
+					if err != nil {
+						c.ResponseError(fmt.Errorf(c.T("account:Get init score failed, error: %w"), err).Error())
+						return
+					}
+
+					userId := userInfo.Id
+					if userId == "" {
+						userId = util.GenerateId()
+					}
+
+					// Generate username for SAML user if not provided
+					username := userInfo.Username
+					if username == "" {
+						// Use email prefix or generate a username
+						if userInfo.Email != "" {
+							username = strings.Split(userInfo.Email, "@")[0]
+						} else {
+							username = util.GenerateId()
+						}
+					}
+
+					// Handle username conflicts
+					var tmpUser *object.User
+					tmpUser, err = object.GetUser(util.GetId(application.Organization, username))
+					if err != nil {
+						c.ResponseError(err.Error())
+						return
+					}
+
+					if tmpUser != nil {
+						var uid uuid.UUID
+						uid, err = uuid.NewRandom()
+						if err != nil {
+							c.ResponseError(err.Error())
+							return
+						}
+
+						uidStr := strings.Split(uid.String(), "-")
+						username = fmt.Sprintf("%s_%s", username, uidStr[1])
+					}
+
+					// Set display name, fallback to username if empty
+					displayName := userInfo.DisplayName
+					if displayName == "" {
+						displayName = username
+					}
+
+					user = &object.User{
+						Owner:             application.Organization,
+						Name:              username,
+						CreatedTime:       util.GetCurrentTime(),
+						Id:                userId,
+						Type:              "normal-user",
+						DisplayName:       displayName,
+						Avatar:            userInfo.AvatarUrl,
+						Address:           []string{},
+						Email:             userInfo.Email,
+						Phone:             userInfo.Phone,
+						CountryCode:       userInfo.CountryCode,
+						Region:            userInfo.CountryCode,
+						Score:             initScore,
+						IsAdmin:           false,
+						IsForbidden:       false,
+						IsDeleted:         false,
+						SignupApplication: application.Name,
+						Properties:        properties,
+					}
+
+					var affected bool
+					affected, err = object.AddUser(user, c.GetAcceptLanguage())
+					if err != nil {
+						c.ResponseError(err.Error())
+						return
+					}
+
+					if !affected {
+						c.ResponseError(fmt.Sprintf(c.T("auth:Failed to create user, user information is invalid: %s"), util.StructToJson(user)))
+						return
+					}
+
+					if providerItem.SignupGroup != "" {
+						user.Groups = []string{providerItem.SignupGroup}
+						_, err = object.UpdateUser(user.GetId(), user, []string{"groups"}, false)
+						if err != nil {
+							c.ResponseError(err.Error())
+							return
+						}
+					}
+				}
+
+				// sync info from 3rd-party if possible
+				_, err = object.SetUserOAuthProperties(organization, user, provider.Type, userInfo)
+				if err != nil {
+					c.ResponseError(err.Error())
+					return
+				}
+
+				_, err = object.LinkUserAccount(user, provider.Type, userInfo.Id)
+				if err != nil {
+					c.ResponseError(err.Error())
+					return
+				}
+
+				resp = c.HandleLoggedIn(application, user, &authForm)
+
+				c.Ctx.Input.SetParam("recordUserId", user.GetId())
+				c.Ctx.Input.SetParam("recordSignup", "true")
 			}
 			// resp = &Response{Status: "ok", Msg: "", Data: res}
 		} else { // authForm.Method != "signup"
